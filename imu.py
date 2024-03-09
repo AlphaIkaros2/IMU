@@ -11,6 +11,12 @@ class IMU(object):
         self.gyro     = np.zeros(3)
         self.magne    = np.zeros(3)
         self.dt       = 1 / self.sampling
+
+        self.x = np.zeros(9)
+        self.P = np.eye(9) * 5000
+        self.R = np.eye(3) * 1000000
+
+        self.bias = np.array([0.04, 0.02, 0.02])
   
     # Get variance and bias from data
     def initVariance(self, data, noiseCoeff={'w': 100, 'a': 100, 'm': 10}):
@@ -140,6 +146,9 @@ class IMU(object):
         euler = np.deg2rad(euler)
         a     = data[:, 3:6]
 
+        aVar = a.mean(axis=0)
+        accelNoise = np.linalg.norm(aVar) * 100
+
         # ---- Data container ----
         aNav = []
         oriX = []
@@ -149,7 +158,7 @@ class IMU(object):
         t = 0
         while t < sampleSize:
             eulert = euler[t, np.newaxis].T
-            at     = a[t, np.newaxis].T
+            at     = a[t, np.newaxis].T - self.bias[:, np.newaxis].T
             q = euler2Quat(eulert[1][0], eulert[2][0], eulert[0][0]) 
             q = normalized(q)
 
@@ -170,15 +179,15 @@ class IMU(object):
         oriX = np.array(oriX)
         oriY = np.array(oriY)
         oriZ = np.array(oriZ)
-        return (aNav, oriX, oriY, oriZ)
+        return (aNav, oriX, oriY, oriZ, accelNoise)
 
-    def posTrackWithConstantSpeed(self, aNav, data):
+    def posTrackWithConstantSpeed(self, aNav, data, accelNoise, count):
         #  ---- Data preparation ----
         sampleSize = np.shape(data)[0]
         euler = data[:, 0]
         euler = np.deg2rad(euler)
-        aVar = aNav.mean(axis=0)
-        accelNoise = np.linalg.norm(aVar) * 100
+        # aVar = aNav.mean(axis=0)
+        # accelNoise = np.linalg.norm(aVar) * 100
 
         # ---- Init kalman filter matrix ----
         # Transition matrix
@@ -195,53 +204,51 @@ class IMU(object):
         Qt = accelNoise * np.array([[self.dt**5 / 20, self.dt**4 / 8, self.dt**3/ 6],
                                     [self.dt**4 / 8, self.dt**3 / 9, self.dt**2 / 2],
                                     [self.dt**3 / 6, self.dt**2 / 2, self.dt]])
+        
+        # print(accelNoise)
         Q = np.eye(9)
         Q[0:3, 0:3] = Qt
         Q[3:6, 3:6] = Qt
         Q[6:9, 6:9] = Qt
 
-        P = np.eye(9) * 500
-        x = np.zeros(F.shape[0])
-
         H = np.array([[0, 1, 0, 0, 0, 0, 0, 0, 0],
                       [0, 0, 0, 0, 1, 0, 0, 0, 0],
                       [0, 0, 0, 0, 0, 0, 0, 1, 0],])
         
-        R = np.eye(3) * (0.5)
-
         # ---- Data container ----
         pos = []
 
         t = 0
         while t < sampleSize: 
             # ---- Predict step ----
-            x[2] = aNav[t][0]
-            x[5] = aNav[t][1]
-            x[8] = aNav[t][2]
+            self.x[2] = aNav[t][0]
+            self.x[5] = aNav[t][1]
+            self.x[8] = aNav[t][2]
 
-            x = F @ x
-            P = F @ P @ F.T+ Q
+            self.x = F @ self.x
+            self.P = F @ self.P @ F.T + Q
 
             # ---- Update step ----
             # Đưa speed xe về navigation frame
             # speed = yawRotationMatrix(euler[t][0]) @ speed  
-            z = [0, 0, .1] # thử motion lên xuống với vận tốc theo trục yaw là 10 cm/s
-            if t >= sampleSize / 2:
-                z = [0, 0, -.1]
-            S = H @ P @ H.T + R
+            z = [0., 0., 1.] # Cho chạy x, y trong vòng 2.5 giây đầu 
+            if count >= 565 / 2:
+                z = [0., 0., -1.] # dừng lại 2.5 giây cuối 
+            S = H @ self.P @ H.T + self.R
             Sinv = np.linalg.inv(S)
-            K = P @ H.T @ Sinv
+            K = self.P @ H.T @ Sinv
 
-            y = z - H @ x
-            x = x + K @ y
+            y = z - H @ self.x
+            self.x = self.x + K @ y
 
             I = np.eye(n)
-            P = (I -K @ H) @ P
-            P = 0.5 * (P + P.T)    
+            self.P = (I - K @ H) @ self.P
+            self.P = 0.5 * (self.P + self.P.T)    
 
-            pos.append([x[0], x[3], x[6]])
+            pos.append([self.x[0], self.x[3], self.x[6]])
             t += 1
         pos = np.array(pos)
+        print(self.P)
         fields = ['x', 'y', 'z']
         filename = "pos.csv"
         with open(filename, 'w') as csvfile:
@@ -338,40 +345,55 @@ class IMU(object):
 
 def plot_trajectory():
     data = []
-    with open("data1.csv", 'r') as file:
+    with open("data_new.csv", 'r') as file:
         csvreader = csv.reader(file)
         header = next(csvreader)
         for row in csvreader:
-            rowt = np.array(row[1:10])
-            data.append(rowt)
+            # rowt = np.array(row[1:10])
+            data.append(row)
     data = np.array(data, dtype=np.float64)
-
-    print(data)
+    plot3([data[:, 3:6]])
 
     tracker = IMU(sampling=100)
-    print('initializing...')
-    init_list = tracker.initVariance(data[5:30])
+    t = 0
+    p_p = []
+    a_nav_p = []
+    while t < len(data):
+        new_data = data[t:t+10]
+        # print('initializing...')
+        # init_list = tracker.initVariance(data[5:30])
 
-    print('--------')
-    print('processing...')
+        # print('--------')
+        # print('processing...')
+        
+        # EKF step
+        # a_nav, orix, oriy, oriz = tracker.attitudeTracking(data[30:], init_list)
+        a_nav, orix, oriy, oriz, accelNoise = tracker.attitudeObtain(new_data)
+        a_nav_p.append(a_nav)
+
+        # Acceleration correction step
+        
+        # a_nav_filtered = tracker.removeAccErr(a_nav, filter=False)
+        # plot3([a_nav, a_nav_filtered])
+        
+
+        # ZUPT step
+        # v = tracker.zupt(a_nav_filtered, threshold=0.2)
+        #plot3([v])
     
-    # EKF step
-    a_nav, orix, oriy, oriz = tracker.attitudeTracking(data[30:], init_list)
-    # a_nav, orix, oriy, oriz = tracker.attitudeObtain(data)
+        # Integration Step
+        # p = tracker.positionTracking(a_nav_filtered, v)
+        p = tracker.posTrackWithConstantSpeed(a_nav, new_data, accelNoise, t)
+        p_p.append(p)
+        t = t + 10
+        # plot3D([[p, 'position']])
 
-    # Acceleration correction step
-    
-    a_nav_filtered = tracker.removeAccErr(a_nav, filter=False)
-    #plot3([a_nav, a_nav_filtered])
-
-    # ZUPT step
-    v = tracker.zupt(a_nav_filtered, threshold=0.2)
-    #plot3([v])
- 
-    # Integration Step
-    p = tracker.positionTracking(a_nav_filtered, v)
-    #p = tracker.posTrackWithConstantSpeed(a_nav, data)
-    plot3D([[p, 'position']])
+    pp = np.vstack([row for row in p_p])
+    aa = np.vstack([row for row in a_nav_p])
+    print(len(pp))
+    plot3([aa])
+    plot3([pp])
+    plot3D([[pp, 'position']])
 
 if __name__ == "__main__":
     plot_trajectory()
